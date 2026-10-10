@@ -93,8 +93,8 @@ password, LAN at 192.168.1.1.
 ## Upgrades: sysupgrade
 
 The `*-sysupgrade.bin` from the same build is a normal OpenWrt sysupgrade image
-and can be used on a router running OpenWrt 24.10 or 25.12, whether it was
-installed with this installer or by hand:
+and can be used on a router already running OpenWrt, whether it was installed
+with this installer or by hand:
 
 - On the eMMC system the installer does nothing: `/etc/init.d/usb-installer` only
   acts when the overlay lives on a USB disk, and the reset handler falls back to
@@ -102,8 +102,6 @@ installed with this installer or by hand:
 - sysupgrade on `google,wifi` writes the partitions named `kernel` and `rootfs` on
   the boot device and leaves the GPT alone, so the fresh GUIDs (and an expanded
   rootfs partition, if you resized it) survive the upgrade.
-- The usual OpenWrt advice for upgrades between major releases applies (e.g.
-  24.10 to 25.12: consider `sysupgrade -n`, check the release notes).
 - With a manually installed router *and* the stick plugged in, both devices carry
   the same PARTUUID and sysupgrade may pick the wrong one - unplug the stick.
   With this installer the GUIDs are unique.
@@ -115,7 +113,7 @@ On Linux x86_64 or WSL, with the
 
 ```sh
 ./build.sh                      # OpenWrt 25.12.5
-./build.sh -v 24.10.4           # another release
+./build.sh -v <version>         # another OpenWrt release
 ./build.sh --no-setup-code      # without the setup-code script
 ./build.sh -p "luci-ssl"        # extra packages
 ```
