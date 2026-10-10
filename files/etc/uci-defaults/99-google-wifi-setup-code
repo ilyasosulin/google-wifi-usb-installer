@@ -1,0 +1,68 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Google WiFi, first boot from eMMC: make a fresh install reachable with the
+# setup code printed on the label of the router (VPD key setup_psk):
+#   - root password = setup code (only if root has no password yet)
+#   - 2.4 GHz Wi-Fi "OpenWrt-XXXX" (last 4 hex digits of the label MAC),
+#     WPA2-PSK, key = setup code, bridged to lan
+#
+# Nothing is changed when:
+#   - the board is not google,wifi or the system runs from a USB stick
+#   - setup_psk is missing or not a valid WPA2 passphrase (kernel without the
+#     Google VPD driver: /sys/firmware/vpd/ro is absent)
+#   - Wi-Fi is already configured (any radio enabled), e.g. after a sysupgrade
+#     with kept settings
+# Change both passwords after the first login.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "google,wifi" ] || exit 0
+[ -x /usr/sbin/usb-installer ] && /usr/sbin/usb-installer detect && exit 0
+
+log() { logger -t setup-code "$1"; }
+
+psk="$(tr -d '\000\r\n' < /sys/firmware/vpd/ro/setup_psk 2>/dev/null)"
+if ! echo "$psk" | grep -qE '^[!-~]{8,63}$'; then
+	log "no valid setup_psk in /sys/firmware/vpd/ro - Wi-Fi and root password left as they are"
+	exit 0
+fi
+
+# root password: only if empty
+if grep -q '^root::' /etc/shadow 2>/dev/null; then
+	printf '%s\n%s\n' "$psk" "$psk" | passwd root >/dev/null 2>&1 &&
+		log "root password set to the setup code from the label"
+fi
+
+# Wi-Fi: only on an untouched default configuration
+[ -s /etc/config/wireless ] || wifi config >/dev/null 2>&1
+radio=""
+for r in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+	[ "$(uci -q get "wireless.$r.disabled")" = 1 ] || { log "Wi-Fi already configured - left as it is"; exit 0; }
+	[ "$(uci -q get "wireless.$r.band")" = 2g ] && radio="$r"
+done
+[ -n "$radio" ] || { log "no 2.4 GHz radio found"; exit 0; }
+
+iface=""
+for i in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+	[ "$(uci -q get "wireless.$i.device")" = "$radio" ] && { iface="$i"; break; }
+done
+if [ -z "$iface" ]; then
+	iface="default_$radio"
+	uci set "wireless.$iface=wifi-iface"
+	uci set "wireless.$iface.device=$radio"
+	uci set "wireless.$iface.network=lan"
+	uci set "wireless.$iface.mode=ap"
+fi
+
+. /lib/functions/system.sh
+suffix="$(get_mac_label 2>/dev/null | tr -d ':' | tr 'a-f' 'A-F' | grep -o '....$')"
+ssid="OpenWrt${suffix:+-$suffix}"
+
+uci set "wireless.$iface.ssid=$ssid"
+uci set "wireless.$iface.encryption=psk2"
+uci set "wireless.$iface.key=$psk"
+uci -q delete "wireless.$iface.disabled"
+uci set "wireless.$radio.disabled=0"
+uci commit wireless
+log "Wi-Fi '$ssid' (2.4 GHz, WPA2) enabled, key = setup code from the label"
+
+exit 0

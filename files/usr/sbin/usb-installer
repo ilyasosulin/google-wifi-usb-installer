@@ -1,0 +1,319 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# usb-installer - install OpenWrt from a USB stick to the eMMC of a Google WiFi
+#
+# The USB stick holds a *-squashfs-factory.bin image (written with dd, Rufus in
+# dd mode or the Chromebook Recovery Utility). When the router runs from that
+# stick, a double press of the reset button copies the system to the eMMC:
+#
+#  1. checks: board, eMMC, layout of the stick, squashfs fits before the overlay;
+#     the stick is read completely before anything is written
+#  2. the GPT is written to the eMMC with new random disk and partition GUIDs,
+#     with the backup GPT at the real end of this eMMC (eMMC sizes differ
+#     between units, so the size is read from the device)
+#  3. the kernel partition and the squashfs part of the rootfs partition are
+#     copied - not the overlay of the stick; the overlay area on the eMMC is
+#     marked with 0xdeadc0de so that a fresh overlay is created on first boot
+#  4. the written data is read back and compared with the stick
+#  5. the router reboots into the eMMC system
+#
+# New GUIDs matter: the bootloader passes root=PARTUUID=<kernel partition>/PARTNROFF=1,
+# and with identical GUIDs on stick and eMMC the eMMC kernel could mount the
+# rootfs of the stick. With unique GUIDs the stick may stay plugged in and can
+# be reused for the next router.
+#
+# LED:
+#   cyan              booted from USB, waiting for a double press of reset
+#   fast blinking red installing
+#   3x green          done, rebooting into the eMMC system
+#   solid red         failed before writing - the eMMC was not changed
+#   slow blinking red failed while writing - boot from the stick and repeat
+#
+# Log: logread -e usb-installer, /tmp/usb-installer.log
+#
+# Usage:
+#   usb-installer detect   exit 0 if the system runs from a USB stick
+#   usb-installer ready    enter the waiting state (called by /etc/init.d/usb-installer)
+#   usb-installer button   reset button handler (called by /etc/rc.button/reset)
+#   usb-installer check    run all checks, write nothing, print the result
+#   usb-installer install  install to the eMMC (started by a double press)
+
+TAG="usb-installer"
+MODE_FLAG="/tmp/usb-installer.mode"	# present: running from USB, installer active
+LOCK="/tmp/usb-installer.lock"
+PRESS="/tmp/usb-installer.press"	# time of the previous short press
+LOG="/tmp/usb-installer.log"
+TARGET="/dev/mmcblk0"
+BOARD="google,wifi"
+DOUBLE_PRESS_MAX=2			# seconds between the two presses
+CHECK_ONLY=""
+
+log() {
+	logger -t "$TAG" "$1"
+	echo "$(date '+%F %T') $1" >> "$LOG"
+}
+
+# ---------------------------------------------------------------- LED
+
+led_dir() { ls -d /sys/class/leds/*"$1"* 2>/dev/null | head -n 1; }
+LED_R="$(led_dir Red)"
+LED_G="$(led_dir Green)"
+LED_B="$(led_dir Blue)"
+
+# led_one <sysfs dir> off|on|<on ms>:<off ms>
+led_one() {
+	[ -n "$1" ] && [ -d "$1" ] || return 0
+	case "$2" in
+	off)
+		echo none > "$1/trigger" 2>/dev/null
+		echo 0 > "$1/brightness"
+		;;
+	on)
+		echo none > "$1/trigger" 2>/dev/null
+		cat "$1/max_brightness" > "$1/brightness" 2>/dev/null
+		;;
+	*)
+		echo timer > "$1/trigger" 2>/dev/null
+		echo "${2%%:*}" > "$1/delay_on" 2>/dev/null
+		echo "${2##*:}" > "$1/delay_off" 2>/dev/null
+		;;
+	esac
+}
+
+# led <red> <green> <blue>
+led() {
+	led_one "$LED_R" "$1"
+	led_one "$LED_G" "$2"
+	led_one "$LED_B" "$3"
+}
+
+# ---------------------------------------------------------------- detection
+
+# Block device holding the overlay, e.g. "sda2" (fstools mounts it via a loop
+# device at an offset inside the rootfs partition)
+overlay_part() {
+	local dev b
+
+	dev="$(awk '$2 == "/overlay" {print $1; exit}' /proc/mounts)"
+	case "$dev" in
+	/dev/loop*)
+		b="$(cat "/sys/block/${dev#/dev/}/loop/backing_file" 2>/dev/null)"
+		echo "${b##*/}"
+		;;
+	*)
+		echo "${dev##*/}"
+		;;
+	esac
+}
+
+detect() {
+	case "$(overlay_part)" in
+	sd[a-z][0-9]*) return 0 ;;
+	esac
+	return 1
+}
+
+# ---------------------------------------------------------------- button
+
+button() {
+	local now last
+
+	[ -e "$MODE_FLAG" ] || return 1
+	[ "$ACTION" = released ] || return 0
+	# a long press keeps its usual meaning (factory reset of the stick's overlay)
+	[ "${SEEN:-0}" -lt 1 ] || return 1
+
+	now=$(date +%s)
+	last=$(cat "$PRESS" 2>/dev/null || echo 0)
+	if [ $((now - last)) -le "$DOUBLE_PRESS_MAX" ]; then
+		rm -f "$PRESS"
+		if [ -d "$LOCK" ]; then
+			log "button: installation already running"
+		else
+			log "button: double press, starting installation"
+			setsid /usr/sbin/usb-installer install </dev/null >/dev/null 2>&1 &
+		fi
+	else
+		echo "$now" > "$PRESS"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------- helpers
+
+# fail <0|1> <message>: 0 - the eMMC was not touched, 1 - writing had started
+fail() {
+	log "ERROR: $2"
+	if [ "$1" = 1 ]; then
+		led 1000:1000 off off
+		log "the eMMC may be incomplete: boot from the USB stick again and repeat"
+	else
+		led on off off
+		log "the eMMC was not changed"
+	fi
+	rm -rf "$LOCK"
+	[ -n "$CHECK_ONLY" ] && cat "$LOG"
+	exit 1
+}
+
+# read_le <file> <offset> <bytes>: unsigned little-endian integer
+read_le() {
+	dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null |
+		{ hexdump -v -e '1/1 "%u "' 2>/dev/null || od -An -v -tu1; } |
+		awk '{ for (i = 1; i <= NF; i++) b[n++] = $i }
+		     END { v = 0; for (i = n - 1; i >= 0; i--) v = v * 256 + b[i]; printf "%.0f\n", v }'
+}
+
+# md5_of <device> <start sector> <sectors>
+md5_of() {
+	dd if="$1" bs=512 skip="$2" count="$3" 2>/dev/null | md5sum | cut -d' ' -f1
+}
+
+# part_field <line of sfdisk -d> <field>
+part_field() {
+	echo "$1" | sed -n "s/.*[ ,]$2=\\([^,]*\\).*/\\1/p" | tr -d ' "'
+}
+
+# ---------------------------------------------------------------- install
+
+install() {
+	local board part src dump p1 p2 k_start k_size r_start r_size
+	local loopdev ov_off sq_used sq_sect t_size k_md5 r_md5 newtab tdump i
+
+	mkdir "$LOCK" 2>/dev/null || { log "already running"; exit 0; }
+	: > "$LOG"
+	[ -n "$CHECK_ONLY" ] || led 150:150 off off
+	log "${CHECK_ONLY:+check: }installation started"
+
+	# --- checks: the eMMC is not touched yet ---
+	board="$(cat /tmp/sysinfo/board_name 2>/dev/null)"
+	[ "$board" = "$BOARD" ] || fail 0 "board '$board' is not $BOARD"
+	detect || fail 0 "the system is not running from a USB stick"
+	for t in sfdisk md5sum; do
+		command -v "$t" >/dev/null 2>&1 || fail 0 "$t not found (package: $t)"
+	done
+	[ -b "$TARGET" ] || fail 0 "$TARGET not found"
+	[ "$(cat "/sys/block/${TARGET#/dev/}/ro" 2>/dev/null)" = 0 ] || fail 0 "$TARGET is read-only"
+	grep -q "^$TARGET" /proc/mounts && fail 0 "a partition of $TARGET is mounted"
+
+	part="$(overlay_part)"			# sda2
+	src="/dev/${part%%[0-9]*}"		# /dev/sda
+	[ "${part#"${src#/dev/}"}" = 2 ] || fail 0 "the overlay is on $part, expected partition 2"
+	dump="$(sfdisk -d "$src" 2>/dev/null)" || fail 0 "cannot read the partition table of $src"
+	echo "$dump" | grep -q '^label: gpt' || fail 0 "$src has no GPT"
+	[ "$(echo "$dump" | grep -c "^$src")" = 2 ] ||
+		fail 0 "$src must have exactly 2 partitions (was the image written with dd?)"
+	p1="$(echo "$dump" | grep "^${src}1 ")"
+	p2="$(echo "$dump" | grep "^${src}2 ")"
+	k_start=$(part_field "$p1" start); k_size=$(part_field "$p1" size)
+	r_start=$(part_field "$p2" start); r_size=$(part_field "$p2" size)
+	[ -n "$k_start" ] && [ -n "$k_size" ] && [ -n "$r_start" ] && [ -n "$r_size" ] ||
+		fail 0 "cannot parse the partition table of $src"
+	case "$(part_field "$p1" type)" in
+	[Ff][Ee]3[Aa]2[Aa]5[Dd]-*) ;;
+	*) fail 0 "partition 1 of $src is not a ChromeOS kernel partition" ;;
+	esac
+
+	# squashfs: from the start of partition 2 up to the overlay (fstools loop offset)
+	loopdev="$(awk '$2 == "/overlay" {print $1; exit}' /proc/mounts)"
+	ov_off=$(cat "/sys/block/${loopdev#/dev/}/loop/offset" 2>/dev/null)
+	[ -n "$ov_off" ] && [ "$ov_off" -gt 0 ] || fail 0 "cannot find where the overlay starts"
+	[ $((ov_off % 512)) = 0 ] || fail 0 "overlay offset $ov_off is not sector aligned"
+	[ "$(dd if="${src}2" bs=4 count=1 2>/dev/null)" = hsqs ] || fail 0 "no squashfs at the start of ${src}2"
+	sq_used=$(read_le "${src}2" 40 8)
+	[ "$sq_used" -gt 0 ] && [ "$sq_used" -le "$ov_off" ] ||
+		fail 0 "squashfs size $sq_used does not fit before the overlay ($ov_off)"
+	sq_sect=$((ov_off / 512))
+	[ "$sq_sect" -lt "$r_size" ] || fail 0 "the overlay offset is outside partition 2"
+
+	t_size=$(cat "/sys/block/${TARGET#/dev/}/size")
+	[ $((r_start + r_size + 33)) -le "$t_size" ] || fail 0 "$TARGET is too small ($t_size sectors)"
+	log "source $src: kernel $k_start+$k_size, rootfs $r_start+$r_size, squashfs $sq_used bytes ($sq_sect sectors); target $TARGET: $t_size sectors"
+
+	# read the source completely before writing: also proves the stick is readable
+	k_md5=$(md5_of "$src" "$k_start" "$k_size")
+	r_md5=$(md5_of "$src" "$r_start" "$sq_sect")
+	[ ${#k_md5} = 32 ] && [ ${#r_md5} = 32 ] || fail 0 "cannot read $src"
+
+	# same layout, new disk and partition GUIDs; sfdisk puts the backup GPT at the end
+	newtab="$(echo "$dump" | awk -v disk="$(cat /proc/sys/kernel/random/uuid)" '
+		/^label-id:|^device:|^last-lba:/ { next }
+		/^label:/ { print; print "label-id: " disk; next }
+		/ : start=/ {
+			sub(/^[^:]*: /, "")
+			"cat /proc/sys/kernel/random/uuid" | getline u
+			close("cat /proc/sys/kernel/random/uuid")
+			sub(/uuid=[^,]*/, "uuid=" u)
+			print
+			next
+		}
+		{ print }')"
+
+	if [ -n "$CHECK_ONLY" ]; then
+		log "check passed, nothing written (new partition table for $TARGET below)"
+		echo "$newtab" >> "$LOG"
+		led off on on
+		rm -rf "$LOCK"
+		cat "$LOG"
+		exit 0
+	fi
+
+	# --- writing: from here on a failure leaves the eMMC incomplete ---
+	log "writing the partition table"
+	echo "$newtab" | sfdisk -q --no-reread --no-tell-kernel "$TARGET" >> "$LOG" 2>&1 ||
+		fail 1 "sfdisk could not write the partition table to $TARGET"
+	log "writing the kernel ($k_size sectors)"
+	dd if="$src" of="$TARGET" bs=512 skip="$k_start" seek="$k_start" count="$k_size" conv=notrunc 2>>"$LOG" ||
+		fail 1 "write error (kernel)"
+	log "writing squashfs ($sq_sect sectors)"
+	dd if="$src" of="$TARGET" bs=512 skip="$r_start" seek="$r_start" count="$sq_sect" conv=notrunc 2>>"$LOG" ||
+		fail 1 "write error (rootfs)"
+	# overlay area: 64 KiB of zeroes starting with 0xdeadc0de - fstools formats it on first boot
+	dd if=/dev/zero of="$TARGET" bs=512 seek=$((r_start + sq_sect)) count=128 conv=notrunc 2>>"$LOG" ||
+		fail 1 "write error (overlay marker)"
+	printf '\336\255\300\336' |
+		dd of="$TARGET" bs=512 seek=$((r_start + sq_sect)) count=1 conv=sync,notrunc 2>>"$LOG" ||
+		fail 1 "write error (overlay marker)"
+	sync
+
+	# --- verify: read from the eMMC, not from the page cache ---
+	log "verifying"
+	echo 3 > /proc/sys/vm/drop_caches
+	[ "$(md5_of "$TARGET" "$k_start" "$k_size")" = "$k_md5" ] || fail 1 "kernel on $TARGET differs from $src"
+	[ "$(md5_of "$TARGET" "$r_start" "$sq_sect")" = "$r_md5" ] || fail 1 "rootfs on $TARGET differs from $src"
+	tdump="$(sfdisk -d "$TARGET" 2>/dev/null)"
+	[ "$(echo "$tdump" | grep -c "^$TARGET")" = 2 ] || fail 1 "the partition table on $TARGET was not written"
+	echo "$tdump" | grep -q "start= *$k_start, size= *$k_size," &&
+		echo "$tdump" | grep -q "start= *$r_start, size= *$r_size," ||
+		fail 1 "the partition layout on $TARGET differs"
+	[ "$(read_le "$TARGET" $(((r_start + sq_sect) * 512)) 4)" = 3737169374 ] ||
+		fail 1 "overlay marker not found on $TARGET"
+
+	log "done: OpenWrt installed on $TARGET, rebooting"
+	i=0
+	while [ "$i" -lt 3 ]; do
+		led off on off; sleep 1
+		led off off off; sleep 1
+		i=$((i + 1))
+	done
+	led off on off
+	sync
+	reboot
+}
+
+ready() {
+	detect || { rm -f "$MODE_FLAG"; return 1; }
+	touch "$MODE_FLAG"
+	led off on on
+	log "booted from a USB stick: press reset twice to install OpenWrt on $TARGET"
+}
+
+case "${1:-}" in
+detect)  detect ;;
+ready)   ready ;;
+button)  button ;;
+check)   CHECK_ONLY=1; install ;;
+install) install ;;
+*) echo "usage: $0 {detect|ready|button|check|install}" >&2; exit 2 ;;
+esac
