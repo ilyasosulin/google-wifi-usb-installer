@@ -1,0 +1,36 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+# Running from a USB stick: a double short press installs to the eMMC
+# (/usr/sbin/usb-installer). A long press keeps its usual meaning below.
+[ -x /usr/sbin/usb-installer ] && /usr/sbin/usb-installer button && return 0
+
+OVERLAY="$( grep ' /overlay ' /proc/mounts )"
+
+case "$ACTION" in
+pressed)
+	[ -z "$OVERLAY" ] && return 0
+
+	return 5
+;;
+timeout)
+	. /etc/diag.sh
+	set_state failsafe
+;;
+released)
+	if [ "$SEEN" -lt 1 ]
+	then
+		[ -e /tmp/usb-installer.mode ] && return 0
+		echo "REBOOT" > /dev/console
+		sync
+		reboot
+	elif [ "$SEEN" -ge 5 -a -n "$OVERLAY" ]
+	then
+		echo "FACTORY RESET" > /dev/console
+		factoryreset -y && reboot &
+	fi
+;;
+esac
+
+return 0

@@ -1,0 +1,62 @@
+name: Build images
+
+# Manual run: Actions -> Build images -> Run workflow (choose the OpenWrt version).
+# Pushing a tag like "v25.12.5-1" builds that OpenWrt version and publishes a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: OpenWrt release
+        default: 25.12.5
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OpenWrt version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            v="${{ github.event.inputs.version }}"
+          else
+            v="${GITHUB_REF_NAME#v}"; v="${v%-*}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: ImageBuilder dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential file gawk gettext git libncurses-dev \
+            libssl-dev python3 rsync unzip wget xsltproc zlib1g-dev zstd
+
+      - name: Build
+        run: ./build.sh -v "${{ steps.ver.outputs.version }}"
+
+      - name: Checksums
+        working-directory: out/${{ steps.ver.outputs.version }}
+        run: sha256sum *google_wifi*.bin > sha256sums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: google-wifi-${{ steps.ver.outputs.version }}
+          path: |
+            out/${{ steps.ver.outputs.version }}/*google_wifi*.bin
+            out/${{ steps.ver.outputs.version }}/sha256sums.txt
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/${{ steps.ver.outputs.version }}/*google_wifi*.bin
+            out/${{ steps.ver.outputs.version }}/sha256sums.txt

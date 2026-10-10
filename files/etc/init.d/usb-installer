@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+# When booted from a USB stick: enter the installer's waiting state (LED cyan,
+# double press of reset installs to the eMMC). Does nothing when booted from eMMC.
+
+START=99
+
+start() {
+	/usr/sbin/usb-installer ready
+	return 0
+}
